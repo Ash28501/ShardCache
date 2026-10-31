@@ -1,4 +1,4 @@
-from prometheus_client import Counter, CollectorRegistry, generate_latest
+from prometheus_client import CollectorRegistry, Counter, generate_latest
 
 registry = CollectorRegistry()
 
