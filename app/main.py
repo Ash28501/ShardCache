@@ -1,35 +1,45 @@
-from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import Response
-import time
-import logging
-import redis
 import asyncio
+import logging
+import os
 from contextlib import asynccontextmanager
 
+import redis
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import Response
+
 from .cache import ShardCache
+from .metrics import cache_hits, cache_misses, get_metrics, http_requests_total, rate_limit_rejections
 from .ratelimiter import TokenBucketLimiter
-from .metrics import http_requests_total, cache_hits, cache_misses, rate_limit_rejections, get_metrics
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 redis_client = None
 cache = None
-rate_limiter = TokenBucketLimiter(capacity=20, refill_rate=10.0)
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+NUM_SHARDS = int(os.getenv("NUM_SHARDS", "4"))
+VNODES = int(os.getenv("VNODES", "150"))
+RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+rate_limiter = TokenBucketLimiter(
+    capacity=int(os.getenv("RATE_LIMIT_CAPACITY", "20")),
+    refill_rate=float(os.getenv("RATE_LIMIT_REFILL_PER_SEC", "10")),
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis_client, cache
     # Startup
     try:
-        redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=False)
+        redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=False)
         redis_client.ping()
         logger.info("✅ Connected to Redis successfully")
     except Exception as e:
         logger.warning(f"⚠️ Could not connect to Redis: {e}. Running in memory-only mode.")
         redis_client = None
 
-    cache = ShardCache(num_shards=4, max_size_per_shard=500, redis_client=redis_client)
+    cache = ShardCache(num_shards=NUM_SHARDS, max_size_per_shard=500,
+                       redis_client=redis_client, vnodes=VNODES)
     if redis_client:
         cache.load_from_redis()
 
@@ -48,13 +58,15 @@ async def lifespan(app: FastAPI):
     if redis_client:
         try:
             redis_client.bgsave()
-        except:
+        except redis.RedisError:
             pass
         redis_client.close()
 
 app = FastAPI(title="ShardCache", version="1.1.0", lifespan=lifespan)
 
 def rate_limit(request: Request):
+    if not RATE_LIMIT_ENABLED:
+        return "disabled"
     client_ip = request.client.host if request.client else "unknown"
     if not rate_limiter.allow_request(client_ip):
         rate_limit_rejections.labels(identifier=client_ip).inc()
@@ -63,7 +75,6 @@ def rate_limit(request: Request):
 
 @app.middleware("http")
 async def metrics_middleware(request: Request, call_next):
-    start_time = time.time()
     response = await call_next(request)
     http_requests_total.labels(
         method=request.method,
@@ -90,6 +101,15 @@ async def get_key(key: str, _: str = Depends(rate_limit)):
 async def delete_key(key: str, _: str = Depends(rate_limit)):
     deleted = cache.delete(key)
     return {"status": "ok", "deleted": deleted}
+
+@app.post("/shards")
+async def add_shard():
+    """Scale out by one shard; only keys whose ring segment changed are moved."""
+    return cache.add_shard()
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "redis": bool(redis_client)}
 
 @app.get("/stats")
 async def get_stats():

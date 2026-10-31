@@ -1,9 +1,10 @@
-from collections import OrderedDict
-import time
 import json
-from typing import Any, Optional, Dict
-import redis
 import logging
+import time
+from collections import OrderedDict
+from typing import Any, Dict, Optional
+
+from .hashring import ConsistentHashRing
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +42,39 @@ class LRUShard:
 
 
 class ShardCache:
-    def __init__(self, num_shards: int = 4, max_size_per_shard: int = 500, redis_client=None):
-        self.num_shards = num_shards
+    def __init__(self, num_shards: int = 4, max_size_per_shard: int = 500,
+                 redis_client=None, vnodes: int = 150):
+        self.max_size_per_shard = max_size_per_shard
         self.shards = [LRUShard(max_size_per_shard) for _ in range(num_shards)]
+        self.ring = ConsistentHashRing(range(num_shards), vnodes=vnodes)
         self.redis_client = redis_client
 
+    @property
+    def num_shards(self) -> int:
+        return len(self.shards)
+
     def _get_shard_index(self, key: str) -> int:
-        return hash(key) % self.num_shards
+        return self.ring.get_node(key)
+
+    def add_shard(self) -> Dict:
+        """Add a shard and move only the keys whose ring position changed.
+
+        Returns how many keys moved, which with consistent hashing is roughly
+        1/(N+1) of the keys rather than nearly all of them.
+        """
+        new_idx = len(self.shards)
+        self.shards.append(LRUShard(self.max_size_per_shard))
+        self.ring.add_node(new_idx)
+        moved = 0
+        total = 0
+        for idx, shard in enumerate(self.shards[:-1]):
+            for key in list(shard.cache.keys()):
+                total += 1
+                if self.ring.get_node(key) != idx:
+                    value, expiry = shard.cache.pop(key)
+                    self.shards[new_idx].cache[key] = (value, expiry)
+                    moved += 1
+        return {"new_shard": new_idx, "keys_moved": moved, "keys_total": total}
 
     def set(self, key: str, value: Any, ttl: int = 0):
         shard_idx = self._get_shard_index(key)
@@ -89,6 +116,7 @@ class ShardCache:
     def get_stats(self) -> Dict:
         return {
             "total_shards": self.num_shards,
+            "vnodes_per_shard": self.ring.vnodes,
             "shards": [{"shard_id": i, "size": shard.size()} for i, shard in enumerate(self.shards)]
         }
 
@@ -106,7 +134,7 @@ class ShardCache:
                         value = json.loads(data)
                         self.set(key, value, ttl=300)
                         count += 1
-                    except:
+                    except (ValueError, TypeError):
                         pass
             logger.info(f"Loaded {count} keys from Redis")
         except Exception as e:

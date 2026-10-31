@@ -1,7 +1,8 @@
 import time
-from threading import Lock
 from collections import defaultdict
 from dataclasses import dataclass
+from threading import Lock
+
 
 @dataclass
 class Bucket:
